@@ -11,6 +11,8 @@ interface Player {
   isImposter: boolean;
   votedFor: string | null;
   votesReceived: number;
+  isReadyToVote: boolean;
+  hasMessagedThisRound: boolean;
 }
 
 interface Room {
@@ -22,6 +24,9 @@ interface Room {
   messages: { sender: string; text: string; id: string }[];
   winner: "players" | "imposter" | null;
   kickedPlayer: string | null;
+  gameDuration: number;
+  votingDuration: number;
+  readyToVoteCount: number;
 }
 
 const TOPICS = [
@@ -30,6 +35,15 @@ const TOPICS = [
   "Gardening", "Reading", "Bicycling", "Swimming", "Dancing",
   "Painting", "Yoga", "Camping", "Skiing", "Surfing", "Fishing"
 ];
+
+function generateRoomId() {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // Avoid ambiguous characters like I, O, 0, 1
+  let result = "";
+  for (let i = 0; i < 6; i++) {
+    result += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return result;
+}
 
 async function startServer() {
   const app = express();
@@ -46,14 +60,16 @@ async function startServer() {
     console.log("User connected:", socket.id);
 
     socket.on("create-room", ({ name }) => {
-      const roomId = Math.random().toString(36).substring(2, 8).toUpperCase();
+      const roomId = generateRoomId();
       const player: Player = {
         id: socket.id,
-        name,
+        name: name.trim(),
         isHost: true,
         isImposter: false,
         votedFor: null,
         votesReceived: 0,
+        isReadyToVote: false,
+        hasMessagedThisRound: false,
       };
       const room: Room = {
         id: roomId,
@@ -64,47 +80,63 @@ async function startServer() {
         messages: [],
         winner: null,
         kickedPlayer: null,
+        gameDuration: 120,
+        votingDuration: 60,
+        readyToVoteCount: 0,
       };
       rooms.set(roomId, room);
       socket.join(roomId);
       socket.emit("room-joined", { roomId, player, room });
-      console.log(`Room ${roomId} created by ${name}`);
+      console.log(`Room ${roomId} created by ${name.trim()} (Socket: ${socket.id})`);
     });
 
     socket.on("join-room", ({ roomId, name }) => {
-      console.log(`Join request from ${name} for room ${roomId}`);
-      const normalizedRoomId = roomId.toUpperCase();
+      if (!roomId || !name) {
+        socket.emit("error", "Room ID and Name are required");
+        return;
+      }
+
+      const normalizedRoomId = roomId.trim().toUpperCase();
+      const playerName = name.trim();
+      
+      console.log(`Join request from ${playerName} for room ${normalizedRoomId} (Socket: ${socket.id})`);
       const room = rooms.get(normalizedRoomId);
       
       if (!room) {
-        console.log(`Room ${normalizedRoomId} not found`);
-        socket.emit("error", "Room not found");
+        console.log(`Room ${normalizedRoomId} not found. Available rooms: ${Array.from(rooms.keys()).join(", ")}`);
+        socket.emit("error", "Room not found. Make sure you are using the correct ID and are on the same environment (Dev/Preview).");
         return;
       }
 
       // Check if player with this socket ID is already in the room
-      const existingPlayer = room.players.find(p => p.id === socket.id);
-      if (existingPlayer) {
-        console.log(`Player ${name} with socket ${socket.id} already in room ${normalizedRoomId}. Re-sending room data.`);
-        socket.emit("room-joined", { roomId: normalizedRoomId, player: existingPlayer, room });
+      const existingPlayerBySocket = room.players.find(p => p.id === socket.id);
+      if (existingPlayerBySocket) {
+        console.log(`Player ${playerName} with socket ${socket.id} already in room ${normalizedRoomId}.`);
+        socket.emit("room-joined", { roomId: normalizedRoomId, player: existingPlayerBySocket, room });
         return;
       }
 
       // Check if name is already taken in the room
-      const existingPlayerByName = room.players.find(p => p.name.toLowerCase() === name.toLowerCase());
+      const existingPlayerByName = room.players.find(p => p.name.toLowerCase() === playerName.toLowerCase());
       if (existingPlayerByName) {
-        // If the name exists, we allow the new socket to "take over" this player slot.
-        // This handles cases where a user refreshes or reconnects with a new socket ID.
-        console.log(`Player ${name} re-joining with new socket ${socket.id}. Updating player ID.`);
-        existingPlayerByName.id = socket.id;
-        socket.join(normalizedRoomId);
-        socket.emit("room-joined", { roomId: normalizedRoomId, player: existingPlayerByName, room });
-        io.to(normalizedRoomId).emit("player-joined", room.players);
-        return;
+        // Check if the existing player's socket is still active
+        const existingSocket = io.sockets.sockets.get(existingPlayerByName.id);
+        if (existingSocket && existingSocket.connected) {
+          socket.emit("error", "This name is already taken in the room.");
+          return;
+        } else {
+          // If the socket is not connected, allow taking over the slot (reconnect)
+          console.log(`Player ${playerName} re-joining with new socket ${socket.id}. Updating player ID.`);
+          existingPlayerByName.id = socket.id;
+          socket.join(normalizedRoomId);
+          socket.emit("room-joined", { roomId: normalizedRoomId, player: existingPlayerByName, room });
+          io.to(normalizedRoomId).emit("player-joined", room.players);
+          return;
+        }
       }
 
       if (room.players.length >= 15) {
-        socket.emit("error", "Room is full");
+        socket.emit("error", "Room is full (max 15 players)");
         return;
       }
       if (room.status !== "lobby") {
@@ -114,20 +146,54 @@ async function startServer() {
 
       const player: Player = {
         id: socket.id,
-        name,
+        name: playerName,
         isHost: false,
         isImposter: false,
         votedFor: null,
         votesReceived: 0,
+        isReadyToVote: false,
+        hasMessagedThisRound: false,
       };
       
       room.players.push(player);
       socket.join(normalizedRoomId);
       
-      console.log(`Player ${name} joined room ${normalizedRoomId}. Total players: ${room.players.length}`);
+      console.log(`Player ${playerName} joined room ${normalizedRoomId}. Total players: ${room.players.length}`);
       
       socket.emit("room-joined", { roomId: normalizedRoomId, player, room });
       io.to(normalizedRoomId).emit("player-joined", room.players);
+    });
+
+    socket.on("update-settings", ({ roomId, gameDuration, votingDuration }) => {
+      const room = rooms.get(roomId);
+      if (!room || room.status !== "lobby") return;
+
+      const host = room.players.find(p => p.id === socket.id);
+      if (!host || !host.isHost) return;
+
+      room.gameDuration = gameDuration;
+      room.votingDuration = votingDuration;
+      io.to(roomId).emit("settings-updated", { gameDuration, votingDuration });
+    });
+
+    socket.on("ready-to-vote", (roomId) => {
+      const room = rooms.get(roomId);
+      if (!room || room.status !== "playing") return;
+
+      const player = room.players.find(p => p.id === socket.id);
+      if (!player || player.isReadyToVote) return;
+
+      player.isReadyToVote = true;
+      room.readyToVoteCount = room.players.filter(p => p.isReadyToVote).length;
+
+      io.to(roomId).emit("player-ready-to-vote", { playerId: player.id, readyToVoteCount: room.readyToVoteCount });
+
+      if (room.readyToVoteCount > room.players.length / 2) {
+        room.status = "voting";
+        room.timer = room.votingDuration;
+        io.to(roomId).emit("voting-started", room);
+        startVotingTimer(roomId);
+      }
     });
 
     socket.on("start-game", (roomId) => {
@@ -142,6 +208,8 @@ async function startServer() {
         p.isImposter = false;
         p.votedFor = null;
         p.votesReceived = 0;
+        p.isReadyToVote = false;
+        p.hasMessagedThisRound = false;
       });
 
       // Assign Imposter
@@ -151,10 +219,11 @@ async function startServer() {
       // Assign Topic
       room.topic = TOPICS[Math.floor(Math.random() * TOPICS.length)];
       room.status = "playing";
-      room.timer = 120; // 2 minutes
+      room.timer = room.gameDuration;
       room.messages = [];
       room.winner = null;
       room.kickedPlayer = null;
+      room.readyToVoteCount = 0;
 
       io.to(roomId).emit("game-started", room);
 
@@ -172,17 +241,45 @@ async function startServer() {
         if (currentRoom.timer <= 0) {
           clearInterval(interval);
           currentRoom.status = "voting";
+          currentRoom.timer = currentRoom.votingDuration;
           io.to(roomId).emit("voting-started", currentRoom);
+          startVotingTimer(roomId);
         }
       }, 1000);
     });
 
+    function startVotingTimer(roomId: string) {
+      const interval = setInterval(() => {
+        const currentRoom = rooms.get(roomId);
+        if (!currentRoom || currentRoom.status !== "voting") {
+          clearInterval(interval);
+          return;
+        }
+
+        currentRoom.timer--;
+        io.to(roomId).emit("timer-update", currentRoom.timer);
+
+        if (currentRoom.timer <= 0) {
+          clearInterval(interval);
+          resolveVoting(roomId);
+        }
+      }, 1000);
+    }
+
     socket.on("send-message", ({ roomId, text }) => {
       const room = rooms.get(roomId);
-      if (!room || room.status !== "playing") return;
+      if (!room) return;
+      if (room.status !== "playing" && room.status !== "lobby") return;
 
       const player = room.players.find(p => p.id === socket.id);
       if (!player) return;
+
+      // Only enforce one message per round during the "playing" phase
+      if (room.status === "playing" && player.hasMessagedThisRound) return;
+
+      if (room.status === "playing") {
+        player.hasMessagedThisRound = true;
+      }
 
       const message = {
         sender: player.name,
@@ -191,6 +288,15 @@ async function startServer() {
       };
       room.messages.push(message);
       io.to(roomId).emit("new-message", message);
+
+      if (room.status === "playing") {
+        // Check if everyone has messaged
+        const allMessaged = room.players.every(p => p.hasMessagedThisRound);
+        if (allMessaged) {
+          room.players.forEach(p => p.hasMessagedThisRound = false);
+          io.to(roomId).emit("round-reset");
+        }
+      }
     });
 
     socket.on("vote", ({ roomId, targetId }) => {
@@ -321,9 +427,9 @@ async function startServer() {
     });
   }
 
-  const PORT = 3000;
-  httpServer.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on http://localhost:${PORT}`);
+  const PORT = process.env.PORT || 3000;
+  httpServer.listen(Number(PORT), "0.0.0.0", () => {
+    console.log(`Server running on port ${PORT} in ${process.env.NODE_ENV || 'development'} mode`);
   });
 }
 

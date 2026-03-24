@@ -5,6 +5,14 @@ export interface Player {
   isImposter: boolean;
   votedFor: string | null;
   votesReceived: number;
+  isReadyToVote: boolean;
+  hasMessagedThisRound: boolean;
+}
+
+export interface Message {
+  sender: string;
+  text: string;
+  id: string;
 }
 
 export interface Room {
@@ -13,7 +21,10 @@ export interface Room {
   status: "lobby" | "playing" | "voting" | "result";
   topic: string | null;
   timer: number;
-  messages: { sender: string; text: string; id: string }[];
+  messages: Message[];
   winner: "players" | "imposter" | null;
   kickedPlayer: string | null;
+  gameDuration: number;
+  votingDuration: number;
+  readyToVoteCount: number;
 }
